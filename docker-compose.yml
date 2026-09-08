@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:15                  
+    container_name: indexops-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      TZ: Asia/Kolkata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+      
+
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: indexops-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
+  airflow-init:
+    build: .
+    container_name: indexops-airflow-init
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: "a-fixed-secret-key-for-local-dev-only"
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+
+  airflow-webserver:
+    build: .
+    container_name: indexops-airflow-web
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: "a-fixed-secret-key-for-local-dev-only"
+      PYTHONPATH: /opt/airflow
+      # REST API basic auth: needed by the get_airflow_task_logs tool and DAG re-runs.
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      # _PIP_ADDITIONAL_REQUIREMENTS: "sentence-transformers opensearch-py numpy<2"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./indexops:/opt/airflow/indexops
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    build: .
+    container_name: indexops-airflow-scheduler
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: "a-fixed-secret-key-for-local-dev-only"
+      PYTHONPATH: /opt/airflow
+      # _PIP_ADDITIONAL_REQUIREMENTS: "sentence-transformers opensearch-py numpy<2"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./indexops:/opt/airflow/indexops
+      - ./data:/opt/airflow/data
+      - ./knowledge_base:/opt/airflow/knowledge_base
+    command: scheduler
+
+volumes:
+  postgres_data:
+  opensearch_data:

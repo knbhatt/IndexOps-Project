@@ -1,0 +1,12 @@
+# Host-side (Windows) dependencies. The Airflow image has its own deps baked in via Dockerfile.
+psycopg2-binary
+faker
+opensearch-py
+sentence-transformers
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+requests
+python-dotenv
+mcp[cli]>=2
+fastapi
+uvicorn[standard]
+streamlit
