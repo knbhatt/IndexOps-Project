@@ -99,7 +99,8 @@ Failure injection is controlled by Airflow Variables:
 | Agent API | FastAPI (spawns MCP subprocess) |
 | Dashboard | Streamlit |
 | Infra | Docker Compose + custom Airflow Dockerfile (CPU torch baked in) |
-| Demo reset | `demo.ps1` (PowerShell) |
+| Demo reset | `demo.ps1` (PowerShell; random or pinned `-Count` / `-InjectPct`) |
+| Ticket seed data | KameronB synthetic IT call-center tickets (CSV cached in `data/raw/`) |
 
 ### MCP tools (agent)
 
@@ -180,19 +181,28 @@ Wait until these are running:
 
 ### 5. One-click demo seed + failure injection
 
+Ticket text comes from **[KameronB/synthetic-it-callcenter-tickets](https://huggingface.co/datasets/KameronB/synthetic-it-callcenter-tickets)** (~27k synthetic IT tickets). The CSV is auto-downloaded once into `data/raw/` (gitignored) and **reused offline** on later runs. Categories are mapped onto the IndexOps contract (Network / Hardware / Software / Access / Email) with stratified sampling.
+
 ```powershell
+# General testing — random -Count and -InjectPct each run
 .\demo.ps1 -SkipInvestigate
+
+# Demo day — FIXED, known values
+.\demo.ps1 -Count 2500 -InjectPct 0.2 -SkipInvestigate
+
+# Clean baseline (no faults) — expect mismatch_pct ≈ 0
+.\demo.ps1 -Count 800 -InjectPct 0 -InjectType none -SkipInvestigate
 ```
 
 This will:
 
 1. Start the stack if needed  
 2. Clear previous alerts / incidents / remediations  
-3. Seed **~3000** tickets if missing  
+3. Reseed **KameronB** IT tickets (`-Count`, or a random 1500–4200 if omitted)  
 4. Index **5** knowledge-base docs if missing  
-5. Inject `category_mapping_drift` at **20%**  
+5. Inject the chosen failure (`-InjectPct`, or a random 9–31% if omitted)  
 6. Trigger the DAG and wait for SUCCESS  
-7. Print the new **alert id**
+7. Print the new **alert id** (skipped when inject is `none` / `0`)  
 
 ### 6. Open the dashboard
 
@@ -245,11 +255,25 @@ python -u scripts/run_investigation.py --alert 1
 
 ---
 
+## Data source
+
+Tickets are seeded from **KameronB/synthetic-it-callcenter-tickets** (Hugging Face, Apache-2.0-friendly synthetic IT helpdesk text).
+
+```powershell
+python data/generate_tickets.py --count 2500 --truncate
+```
+
+- First run downloads `data/raw/kameronb_sitcc.csv` (~36 MB); later runs reuse the cache (works offline).
+- Rows are mapped onto Network / Hardware / Software / Access / Email and stratified so demos are not Software-only.
+- Source rows in Postgres are **clean**; faults are injected only during the Airflow pipeline when `inject_failure_*` Variables are set.
+
+---
+
 ## Manual setup (without `demo.ps1`)
 
 ```powershell
 docker compose up -d --build
-python data/generate_tickets.py
+python data/generate_tickets.py --count 2500 --truncate
 docker exec indexops-airflow-scheduler python /opt/airflow/data/index_knowledge_base.py
 
 docker exec indexops-airflow-scheduler bash -c "airflow variables set inject_failure_type category_mapping_drift; airflow variables set inject_failure_pct 0.2"
@@ -271,7 +295,8 @@ IndexOps-Project/
 ├── dags/indexops_dag.py        # Pipeline DAG
 ├── init-db/init.sql            # App schema
 ├── data/
-│   ├── generate_tickets.py     # Seed ~3000 fake tickets
+│   ├── generate_tickets.py     # Seed N KameronB IT tickets (--count)
+│   ├── raw/                    # Auto-downloaded KameronB CSV (gitignored)
 │   └── index_knowledge_base.py # Embed + load RAG docs (run in container)
 ├── knowledge_base/             # Data contract, runbooks, past incidents
 ├── indexops/
@@ -314,6 +339,7 @@ docker compose up -d --build
 
 ## Design notes
 
+- **Ticket corpus** — KameronB synthetic IT call-center tickets (not Faker); mapped to the five-category contract.  
 - **Green pipeline ≠ healthy data** — alerts are written by `analyze_index_health` inside the DAG.  
 - **Prompt caching** — static system prompt + tool defs stay at the front of every LLM request (Gemini implicit prefix cache).  
 - **Live “streaming” investigation** — each tool call commits to `investigation_steps` immediately; Streamlit polls every ~2 seconds (no SSE).  

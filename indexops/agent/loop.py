@@ -106,7 +106,14 @@ def _build_user_message(alert_ctx: dict | None, run_id: int | None, question: st
         )
     if question:
         target = f" Focus on run_id {run_id}." if run_id else ""
-        return question + target
+        return (
+            "Interactive investigation (no alert pre-selected). The operator asked:\n"
+            f'"{question}"\n\n'
+            "Use your tools to inspect the current pipeline state, metrics, index health, "
+            "and knowledge base. Determine the root cause with evidence and submit an "
+            "incident report."
+            + target
+        )
     if run_id is not None:
         return (f"Investigate the data quality of pipeline run_id {run_id}. Determine whether the indexed data is "
                 f"correct, find the root cause of any issue with evidence, and submit an incident report.")

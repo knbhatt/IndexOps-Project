@@ -35,3 +35,6 @@ Thumbs.db
 models/
 *.pt
 *.bin
+
+# Large third-party datasets (auto-downloaded by data/generate_tickets.py)
+data/raw/
