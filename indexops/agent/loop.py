@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from indexops import llm_client as llm
+from indexops.agent.validate import validate_report
 from indexops.db import execute, fetch_one, dumps
 from indexops.agent.prompt import SYSTEM_PROMPT, SUBMIT_TOOL, SUBMIT_TOOL_NAME
 
@@ -194,13 +195,34 @@ async def run_investigation(
         submitted: dict[str, Any] | None = None
         for tc in response.tool_calls:
             if tc.name == SUBMIT_TOOL_NAME:
-                _save_report(incident_id, tc.arguments)
-                _log_step(incident_id, tc.name, tc.arguments, {"saved": True, "incident_id": incident_id})
+                validation = validate_report(incident_id, tc.arguments)
+                _log_step(incident_id, "evaluate_report", tc.arguments, {
+                    "passed_deterministic": validation.passed_deterministic,
+                    "deterministic_notes": validation.deterministic_notes,
+                    "verdict": validation.verdict,
+                    "evaluator_notes": validation.evaluator_notes,
+                })
+                if not validation.passed_deterministic or validation.verdict == "evaluator_error":
+                    # Give the model a chance to fix it within its remaining iterations.
+                    messages.append(llm.tool_result_message(tc, {
+                        "status": "rejected",
+                        "reason": validation.deterministic_notes if not validation.passed_deterministic else validation.evaluator_notes,
+                        "instruction": "Correct the report (use only tools you actually called) and call submit_incident_report again.",
+                    }))
+                    if on_step:
+                        on_step("evaluate_report", {"rejected": True, "notes": validation.deterministic_notes})
+                    continue
+                final_report = validation.final_report
+                execute(
+                    "UPDATE incidents SET validation_passed = %s, validation_notes = %s WHERE incident_id = %s",
+                    (True, validation.evaluator_notes, incident_id),
+                )
+                _save_report(incident_id, final_report)
                 if on_step:
-                    on_step(tc.name, tc.arguments)
+                    on_step(tc.name, final_report)
                 messages.append(llm.tool_result_message(
                     tc, {"status": "saved", "incident_id": incident_id}))
-                submitted = tc.arguments
+                submitted = final_report
                 continue
 
             if tc.name in REMEDIATION_TOOLS:

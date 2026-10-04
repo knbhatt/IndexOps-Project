@@ -79,3 +79,6 @@ CREATE TABLE IF NOT EXISTS investigation_steps (
     tool_output JSONB,
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_passed BOOLEAN;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_notes TEXT;

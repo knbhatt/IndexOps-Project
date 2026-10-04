@@ -9,3 +9,6 @@ mcp[cli]>=2
 fastapi
 uvicorn[standard]
 streamlit
+openai>=1.0
+pytest
+pytest-asyncio
