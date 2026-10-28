@@ -19,8 +19,8 @@ OS_HOST = {"host": "opensearch", "port": 9200}
 def get_injection_config():
     """Read the failure-injection switch from Airflow Variables."""
     from airflow.models import Variable
-    inject_type = Variable.get("inject_failure_type", default_var="none")
-    inject_pct = float(Variable.get("inject_failure_pct", default_var="0"))
+    inject_type = Variable.get("inject_failure_type", default_var="none")   # Type of failure to inject
+    inject_pct = float(Variable.get("inject_failure_pct", default_var="0"))  # Percentage of data to inject failures into
     return inject_type, inject_pct
 
 
@@ -47,8 +47,8 @@ def indexops_pipeline():
         run_id = cur.fetchone()[0]
         conn.commit()
 
-        cur.execute("SELECT ticket_id, description, category, priority, assigned_team FROM tickets")
-        rows = cur.fetchall()
+        cur.execute("SELECT ticket_id, description, category, priority, assigned_team FROM tickets")    # Fetch all tickets
+        rows = cur.fetchall()   # Fetch all rows from the query
         conn.close()
 
         tickets = [{"ticket_id": r[0], "description": r[1], "category": r[2],
@@ -69,7 +69,7 @@ def indexops_pipeline():
         return {"run_id": run_id, "tickets": tickets}
 
     @task
-    def validate_data(payload: dict):
+    def validate_data(payload: dict):   # Validate that tickets have required fields and drop any that don't.
         tickets = payload["tickets"]
         valid = [t for t in tickets if t["description"] and t["category"]]
         return {
@@ -80,7 +80,7 @@ def indexops_pipeline():
         }
 
     @task
-    def transform_data(payload: dict):
+    def transform_data(payload: dict):  # Assign the team to each ticket
         inject_type, inject_pct = get_injection_config()
         tickets = payload["tickets"]
 
@@ -170,7 +170,7 @@ def indexops_pipeline():
         run_id = payload["run_id"]
         tickets = payload["tickets"]
 
-        mismatches = sum(1 for t in tickets if t["indexed_team"] != expected_team(t["category"]))
+        mismatches = sum(1 for t in tickets if t["indexed_team"] != expected_team(t["category"])) # Count tickets where the indexed team does not match the expected team based on category
         unique_ids = {t["ticket_id"] for t in tickets}
         duplicate_count = len(tickets) - len(unique_ids)
         total_processed = payload["extracted_count"]

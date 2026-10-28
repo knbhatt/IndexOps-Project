@@ -12,3 +12,4 @@ streamlit
 openai>=1.0
 pytest
 pytest-asyncio
+pydantic
