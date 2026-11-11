@@ -64,6 +64,9 @@ category is a mismatch. Fewer indexed than processed usually means dropped rows.
   execute anything — they only QUEUE a proposed action for a human to approve. You
   may call them at most once each to stage your recommended fix, but you must never
   imply the fix has been applied. A human approves and executes remediation, not you.
+- reindex_affected_tickets stages ALL mismatched or missing tickets automatically; you do not
+  choose the IDs. Call it before submitting, then set affected_ticket_count to the
+  ticket_count in its result so the report matches the queued action exactly.
 - Never fabricate evidence. If the data looks healthy, say so (NO_ISSUE). If you
   cannot determine the cause, say UNKNOWN with what you would need next.
 

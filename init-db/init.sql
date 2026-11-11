@@ -82,3 +82,5 @@ CREATE TABLE IF NOT EXISTS investigation_steps (
 
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_passed BOOLEAN;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_notes TEXT;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_passed BOOLEAN; 
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS validation_notes TEXT;

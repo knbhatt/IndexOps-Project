@@ -8,7 +8,7 @@ services:
       POSTGRES_DB: airflow
       TZ: Asia/Kolkata
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d
@@ -22,8 +22,8 @@ services:
       - DISABLE_SECURITY_PLUGIN=true
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "9200:9200"
-      - "9600:9600"
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
 
@@ -56,7 +56,7 @@ services:
       - ./dags:/opt/airflow/dags
       - ./indexops:/opt/airflow/indexops
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     command: webserver
 
   airflow-scheduler:

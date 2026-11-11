@@ -78,6 +78,12 @@ def _ticket_card(t: dict, extra: str | None = None):
 
 def _render_incident_result(result) -> None:
     """Human-readable summary after an investigation (not raw JSON)."""
+    if result.status == "stale":
+        st.warning(
+            "This alert belongs to an older pipeline run. The index is rebuilt on every run, so it can "
+            "no longer be investigated reliably. Investigate the latest run / latest alert instead."
+        )
+        return
     st.success(
         f"Done — incident #{result.incident_id} · status=`{result.status}` · "
         f"{result.llm_calls} LLM calls · tools={result.tools_used}"
@@ -96,9 +102,14 @@ def _render_incident_result(result) -> None:
     st.markdown(f"**Root cause:** {report.get('root_cause') or '—'}")
     st.markdown(f"**Recommended action:** {report.get('recommended_action') or '—'}")
     if report.get("proposed_remediation_tool") and report.get("proposed_remediation_tool") != "none":
+        queued = fetch_one(
+            "SELECT params->>'ticket_count' AS n FROM remediation_actions "
+            "WHERE incident_id = %s AND status = 'pending' ORDER BY action_id DESC LIMIT 1",
+            (result.incident_id,),
+        )
         st.info(
-            f"Remediation staged: `{report.get('proposed_remediation_tool')}` "
-            f"({report.get('affected_ticket_count') or '?'} tickets). "
+            f"Remediation staged: `{report.get('proposed_remediation_tool')}` · queued scope: "
+            f"{(queued or {}).get('n', 'none')} tickets (report says {report.get('affected_ticket_count') or '?'}). "
             "Go to **Approve Remediation** to execute it — nothing is fixed until you approve."
         )
 
@@ -126,14 +137,19 @@ def _render_incident_result(result) -> None:
     with st.expander("Raw report JSON (debug)"):
         st.json(report)
 
+    # These buttons live inside the "Start investigation" button's branch. After a click Streamlit
+    # reruns with that outer button reset to False, so an `if st.button(...)` here would never fire.
+    # on_click callbacks run BEFORE the rerun, so the navigation is applied reliably.
+    def _go(page_name: str, incident_id=None) -> None:
+        if incident_id is not None:
+            st.session_state["last_incident_id"] = incident_id
+        st.session_state["nav_to"] = page_name
+
     b1, b2 = st.columns(2)
-    if b1.button("Open Incident & Steps", key=f"goto_steps_{result.incident_id}"):
-        st.session_state["last_incident_id"] = result.incident_id
-        st.session_state["nav_to"] = "Incident & Steps"
-        st.rerun()
-    if b2.button("Go to Approve Remediation", key=f"goto_approve_{result.incident_id}"):
-        st.session_state["nav_to"] = "Approve Remediation"
-        st.rerun()
+    b1.button("Open Incident & Steps", key=f"goto_steps_{result.incident_id}",
+              on_click=_go, args=("Incident & Steps", result.incident_id))
+    b2.button("Go to Approve Remediation", key=f"goto_approve_{result.incident_id}",
+              on_click=_go, args=("Approve Remediation",))
 
 
 @st.cache_resource
@@ -587,6 +603,20 @@ elif page == "Approve Remediation":
     st.header("Approve remediation")
     st.caption("Pending actions only become real after you click Approve.")
 
+    _res = st.session_state.pop("approve_result", None)
+    if _res:
+        _st = _res.get("status")
+        if _st == "completed":
+            st.success(_res)
+        elif _st == "partial":
+            st.warning(_res)
+        else:
+            st.error(_res)
+        _pv = _res.get("post_fix_verification")
+        if _pv:
+            st.metric("Mismatch % after fix (fresh source-vs-index comparison)", f"{_pv['mismatched_pct']}%",
+                      delta=f"{_pv['mismatched_count']} mismatched, {_pv['missing_from_index_count']} missing")
+
     pending = fetch_all(
         """SELECT a.action_id, a.incident_id, a.action_taken, a.status, a.params, a.created_at,
                   i.root_cause
@@ -609,24 +639,23 @@ elif page == "Approve Remediation":
                     st.markdown(f"**Reason:** {params['reason']}")
                 if isinstance(params, dict) and params.get("ticket_count"):
                     st.markdown(f"**Tickets to fix:** {params['ticket_count']}")
+                _inc = (fetch_one("SELECT validation_passed FROM incidents WHERE incident_id = %s",
+                                  (a["incident_id"],)) if a.get("incident_id") else None)
+                _validated = bool(_inc and _inc["validation_passed"] is True)
+                if _validated:
+                    st.caption("Incident validation: passed")
+                else:
+                    st.warning("Incident is NOT validated (reflection did not pass). Approval is blocked "
+                               "unless you tick the manual override below.")
+                _override = st.checkbox("Override: approve despite missing/failed validation (I reviewed it manually)",
+                                        key=f"ov_{a['action_id']}", disabled=_validated)                
                 with st.expander("Params"):
                     st.json(params)
                 c1, c2 = st.columns(2)
                 if c1.button("Approve & execute", key=f"ok_{a['action_id']}", type="primary"):
                     with st.spinner("Executing remediation…"):
-                        result = approve(a["action_id"])
-                    if result.get("status") == "completed":
-                        st.success(result)
-                        if a["action_taken"] == "reindex_affected_tickets":
-                            with st.spinner("Re-checking source vs index…"):
-                                diff = compare_source_vs_index()
-                            st.metric(
-                                "Mismatch % after fix",
-                                f"{diff['mismatched_pct']}%",
-                                delta=f"{diff['mismatched_count']} tickets remaining",
-                            )
-                    else:
-                        st.error(result)
+                        result = approve(a["action_id"], allow_unvalidated=_override)
+                    st.session_state["approve_result"] = result
                     st.rerun()
                 if c2.button("Reject", key=f"no_{a['action_id']}"):
                     execute(

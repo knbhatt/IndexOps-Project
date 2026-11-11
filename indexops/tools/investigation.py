@@ -1,10 +1,19 @@
 """Investigation tools: diff source vs index, sample evidence, read Airflow logs."""
 import requests
+from indexops.http_util import http_get
 from requests.auth import HTTPBasicAuth
 
 from indexops.config import AIRFLOW_BASE_URL, AIRFLOW_USER, AIRFLOW_PASSWORD, AIRFLOW_DAG_ID
 from indexops.contract import TICKETS_INDEX, TEAMS_BY_CATEGORY, expected_team
+from datetime import datetime, timezone
+
 from indexops.db import fetch_all, fetch_one, os_client
+
+
+def _live_label() -> dict:
+    """Mark observations as live current state (NOT tied to one historical run)."""
+    return {"scope": "live current state of Postgres + OpenSearch (not run-specific)",
+            "observed_at": datetime.now(timezone.utc).isoformat()}
 
 
 def _indexed_docs() -> dict[int, dict]:
@@ -60,7 +69,20 @@ def compare_source_vs_index() -> dict:
         "mismatched_ticket_ids": sorted(mismatched),
         "missing_ticket_ids": sorted(missing)[:200],
         "orphan_ticket_ids": orphans[:200],
+        **_live_label(),
     }
+
+
+def affected_ticket_ids() -> list[int]:
+    """Deterministic repair scope: every ticket mismatched OR missing from the index (full list)."""
+    source = {r["ticket_id"]: r for r in fetch_all("SELECT ticket_id, category FROM tickets")}
+    indexed = _indexed_docs()
+    ids = []
+    for tid, src in source.items():
+        doc = indexed.get(tid)
+        if doc is None or doc.get("assigned_team") != expected_team(src["category"]):
+            ids.append(tid)
+    return sorted(ids)
 
 
 def sample_mismatched_tickets(limit: int = 10) -> dict:
@@ -85,11 +107,11 @@ def sample_mismatched_tickets(limit: int = 10) -> dict:
             })
             if len(samples) >= limit:
                 break
-    return {"samples": samples, "returned": len(samples)}
+    return {"samples": samples, "returned": len(samples), **_live_label()}
 
 
 def _airflow_get(path: str, **params):
-    r = requests.get(f"{AIRFLOW_BASE_URL}/api/v1{path}", params=params,
+    r = http_get(f"{AIRFLOW_BASE_URL}/api/v1{path}", params=params,
                      auth=HTTPBasicAuth(AIRFLOW_USER, AIRFLOW_PASSWORD), timeout=30)
     r.raise_for_status()
     return r

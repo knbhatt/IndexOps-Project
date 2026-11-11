@@ -6,10 +6,12 @@ this module is the only place that executes them.
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
 import requests
+from indexops.http_util import http_post
 from opensearchpy import helpers
 from requests.auth import HTTPBasicAuth
 
@@ -18,42 +20,92 @@ from indexops.contract import TICKETS_INDEX, EMBEDDING_MODEL, EMBEDDING_DIM, exp
 from indexops.db import fetch_one, execute, fetch_all, os_client, dumps
 
 
-def approve(action_id: int) -> dict[str, Any]:
-    """Execute a pending remediation_actions row and mark it completed or failed."""
+def _gate(row: dict[str, Any], allow_unvalidated: bool) -> str | None:
+    """Return a reason the action must NOT run, or None if it may run."""
+    inc = None
+    if row.get("incident_id") is not None:
+        inc = fetch_one(
+            "SELECT status, validation_passed, run_id, report FROM incidents WHERE incident_id = %s",
+            (row["incident_id"],),
+        )
+    if inc is None:
+        return "action has no incident; refusing to run an unreviewed action"
+
+    # Stale incidents are never executable: the index is rebuilt every run, so an older
+    # incident's evidence no longer describes the live state. Re-investigate instead.
+    latest = (fetch_one("SELECT MAX(run_id) AS m FROM pipeline_runs") or {}).get("m")
+    if inc.get("run_id") is not None and latest is not None and inc["run_id"] != latest:
+        return (f"incident is for run {inc['run_id']} but the latest run is {latest}; "
+                "re-investigate the latest run before approving")
+
+    if allow_unvalidated:
+        return None
+    if inc.get("validation_passed") is not True:
+        return ("incident report is not validated (validation_passed is not true); "
+                "fix the report or use the explicit unvalidated override")
+    params = row.get("params") or {}
+    if isinstance(params, str):
+        params = json.loads(params)
+    report = inc.get("report") or {}
+    if isinstance(report, str):
+        report = json.loads(report)
+    if row.get("action_taken") == "reindex_affected_tickets":
+        if report.get("affected_ticket_count") != params.get("ticket_count"):
+            return (f"scope mismatch: report says {report.get('affected_ticket_count')} tickets but the "
+                    f"queued action covers {params.get('ticket_count')}")
+    return None
+
+
+def approve(action_id: int, allow_unvalidated: bool = False) -> dict[str, Any]:
+    """Execute a pending remediation_actions row and mark it completed, partial or failed.
+
+    Refuses when: the action is not pending; the incident is stale (not the latest run); the
+    incident report is not validated or its scope disagrees with the queued action (unless the
+    caller explicitly passes allow_unvalidated=True, a manual override).
+    """
     row = fetch_one("SELECT * FROM remediation_actions WHERE action_id = %s", (action_id,))
     if not row:
         return {"error": f"action_id {action_id} not found"}
     if row["status"] != "pending":
         return {"error": f"action_id {action_id} is '{row['status']}', not 'pending'"}
 
-    execute(
-        "UPDATE remediation_actions SET status = 'running' WHERE action_id = %s",
+    blocked = _gate(row, allow_unvalidated)
+    if blocked:
+        return {"action_id": action_id, "status": "blocked", "error": blocked}
+
+    # Atomic claim: only one concurrent approver can move pending -> running.
+    claimed = execute(
+        "UPDATE remediation_actions SET status = 'running' WHERE action_id = %s AND status = 'pending' "
+        "RETURNING action_id",
         (action_id,),
     )
+    if not claimed:
+        return {"error": f"action_id {action_id} was already claimed by another approval"}
 
     action = row["action_taken"]
     params = row["params"] or {}
     if isinstance(params, str):
-        import json
         params = json.loads(params)
 
     try:
         if action == "reindex_affected_tickets":
             result = _execute_reindex(params.get("ticket_ids") or [])
+            result["post_fix_verification"] = _verify_after_fix()
         elif action == "trigger_pipeline_rerun":
             result = _execute_pipeline_rerun(bool(params.get("reset_injection", True)))
         else:
             raise ValueError(f"unknown action_taken '{action}'")
 
+        fixed, failed = result.get("records_fixed", 0), result.get("records_failed", 0)
+        status = "partial" if failed else "completed"
         execute(
             """UPDATE remediation_actions
-               SET status = 'completed', records_fixed = %s, records_failed = %s,
+               SET status = %s, records_fixed = %s, records_failed = %s,
                    params = COALESCE(params, '{}'::jsonb) || %s::jsonb
                WHERE action_id = %s""",
-            (result.get("records_fixed", 0), result.get("records_failed", 0),
-             dumps({"execution_result": result}), action_id),
+            (status, fixed, failed, dumps({"execution_result": result}), action_id),
         )
-        return {"action_id": action_id, "status": "completed", "action": action, **result}
+        return {"action_id": action_id, "status": status, "action": action, **result}
     except Exception as e:
         execute(
             """UPDATE remediation_actions
@@ -63,6 +115,14 @@ def approve(action_id: int) -> dict[str, Any]:
             (dumps({"execution_error": str(e)}), action_id),
         )
         return {"action_id": action_id, "status": "failed", "action": action, "error": str(e)}
+
+
+def _verify_after_fix() -> dict[str, Any]:
+    """Fresh source-vs-index comparison, stored as durable evidence of what the fix achieved."""
+    from indexops.tools.investigation import compare_source_vs_index
+    d = compare_source_vs_index()
+    return {k: d[k] for k in ("source_count", "indexed_count", "mismatched_count",
+                              "mismatched_pct", "missing_from_index_count", "orphan_in_index_count")}
 
 
 def _execute_reindex(ticket_ids: list[int]) -> dict[str, Any]:
@@ -145,7 +205,7 @@ def _execute_pipeline_rerun(reset_injection: bool) -> dict[str, Any]:
                 timeout=30,
             )
             if r.status_code == 404:
-                r = requests.post(
+                r = http_post(
                     f"{AIRFLOW_BASE_URL}/api/v1/variables",
                     json={"key": key, "value": val},
                     auth=_airflow_auth(),
@@ -154,7 +214,7 @@ def _execute_pipeline_rerun(reset_injection: bool) -> dict[str, Any]:
             r.raise_for_status()
 
     run_id = f"remediation_{int(time.time())}"
-    r = requests.post(
+    r = http_post(
         f"{AIRFLOW_BASE_URL}/api/v1/dags/{AIRFLOW_DAG_ID}/dagRuns",
         json={"dag_run_id": run_id, "conf": {}},
         auth=_airflow_auth(),

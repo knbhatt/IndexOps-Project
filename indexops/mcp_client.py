@@ -27,7 +27,7 @@ class MCPConnection:
 
     async def start(self) -> None:
         self._stack = AsyncExitStack()
-        params = StdioServerParameters(
+        params = StdioServerParameters( # Builds instructions for starting the subprocess using the current Python interpreter and mcp_server.py.
             command=sys.executable,
             args=[self.server_path],
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
@@ -48,7 +48,7 @@ class MCPConnection:
         self._stack, self.session = None, None
 
     async def refresh_tools(self) -> list[dict[str, Any]]:
-        result = await self.session.list_tools()
+        result = await self.session.list_tools() #Sends the MCP “list tools” request to the server.
         self.tools = [
             {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
             for t in result.tools

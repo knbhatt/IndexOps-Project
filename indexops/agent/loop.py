@@ -16,16 +16,19 @@ hold. Its schema is still presented to the model exactly like a normal tool.
 from __future__ import annotations
 
 import json
+
+import jsonschema
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from indexops import llm_client as llm
-from indexops.agent.validate import validate_report
 from indexops.db import execute, fetch_one, dumps
 from indexops.agent.prompt import SYSTEM_PROMPT, SUBMIT_TOOL, SUBMIT_TOOL_NAME
+from indexops.agent.validate import check_report, evaluate_report
 
 MAX_ITERATIONS = 15
 TOOL_RESULT_CHAR_CAP = 8000
+MAX_REJECTIONS = 2  # how many times a draft report may be sent back to the agent
 
 # Tools that accept an incident_id. The LLM must never supply it (it tends to guess
 # the alert_id); the loop injects the real incident_id it created for this run.
@@ -35,7 +38,7 @@ REMEDIATION_TOOLS = {"reindex_affected_tickets", "trigger_pipeline_rerun"}
 @dataclass
 class InvestigationResult:
     incident_id: int
-    status: str                       # 'report_submitted' | 'incomplete'
+    status: str                       # 'report_submitted' | 'incomplete' | 'error' | 'stale'
     report: dict[str, Any] | None
     run_id: int | None
     alert_id: int | None
@@ -92,6 +95,48 @@ def _save_report(incident_id: int, report: dict[str, Any]) -> None:
     )
 
 
+def _latest_run_id() -> int | None:
+    row = fetch_one("SELECT MAX(run_id) AS m FROM pipeline_runs")
+    return (row or {}).get("m")
+
+
+def _queued_reindex_scope(incident_id: int) -> int | None:
+    """ticket_count of the newest pending reindex action queued for this incident, if any."""
+    row = fetch_one(
+        """SELECT params->>'ticket_count' AS n FROM remediation_actions
+           WHERE incident_id = %s AND action_taken = 'reindex_affected_tickets' AND status = 'pending'
+           ORDER BY action_id DESC LIMIT 1""",
+        (incident_id,),
+    )
+    return int(row["n"]) if row and row.get("n") is not None else None
+
+
+def _cancel_pending(incident_id: int) -> None:
+    """An investigation that did not produce a validated report must not leave executable actions."""
+    execute(
+        "UPDATE remediation_actions SET status = 'cancelled' WHERE incident_id = %s AND status = 'pending'",
+        (incident_id,),
+    )
+
+
+def _validate_args(name: str, args: dict[str, Any], schemas: dict[str, Any]) -> str | None:
+    """Check LLM-supplied tool arguments against the tool's JSON schema before calling it."""
+    schema = schemas.get(name)
+    if not schema:
+        return None
+    try:
+        jsonschema.validate(args, schema)
+    except jsonschema.ValidationError as e:
+        return f"invalid arguments for '{name}': {e.message}"
+    except jsonschema.SchemaError:
+        return None
+    return None
+
+
+def _obs_text(observations: list[dict[str, Any]]) -> str:
+    return dumps(observations)
+
+
 # --------------------------------------------------------------------------- #
 # Prompt construction
 # --------------------------------------------------------------------------- #
@@ -145,11 +190,23 @@ async def run_investigation(
     if alert_ctx and run_id is None:
         run_id = alert_ctx["run_id"]
 
+    # Investigations are limited to the latest run: the index is rebuilt every run, and the live
+    # source/index tools cannot reconstruct an older run, so older alerts would be diagnosed with
+    # unrelated current data. Free-form questions are bound to the latest run they observe.
+    latest_run = _latest_run_id()
+    if run_id is None:
+        run_id = latest_run
+    elif latest_run is not None and run_id != latest_run:
+        return InvestigationResult(
+            incident_id=None, status="stale", report=None, run_id=run_id, alert_id=alert_id, llm_calls=0,
+        )
+
     incident_id = _create_incident(alert_id, run_id)
 
     # Static prefix first (system prompt + tool defs) -> cacheable. Dynamic content last.
     tools = llm.mcp_tools_to_llm_tools(mcp.tools) + [SUBMIT_TOOL]
     tool_names = {t["function"]["name"] for t in tools}
+    schemas = {t["function"]["name"]: t["function"].get("parameters") for t in tools}
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _build_user_message(alert_ctx, run_id, question)},
@@ -158,6 +215,10 @@ async def run_investigation(
     llm_calls = 0
     tools_used: list[str] = []
     usage_totals: dict[str, int] = {}
+    observations: list[dict[str, Any]] = []   # real tool results, used by the reflection pass
+    ok_tools: set[str] = set()                # tools that returned without error
+    rejections = 0
+    final_status = "report_submitted"
 
     for iteration in range(MAX_ITERATIONS):
         last_turn = iteration == MAX_ITERATIONS - 1
@@ -174,6 +235,7 @@ async def run_investigation(
                 "UPDATE incidents SET status = 'error', root_cause = %s WHERE incident_id = %s",
                 (f"Investigation aborted: LLM call failed ({type(e).__name__}: {e})", incident_id),
             )
+            _cancel_pending(incident_id)
             return InvestigationResult(
                 incident_id=incident_id, status="error", report=None,
                 run_id=run_id, alert_id=alert_id, llm_calls=llm_calls,
@@ -193,50 +255,94 @@ async def run_investigation(
             continue
 
         submitted: dict[str, Any] | None = None
+        invalid_report = False
         for tc in response.tool_calls:
             if tc.name == SUBMIT_TOOL_NAME:
-                validation = validate_report(incident_id, tc.arguments)
-                _log_step(incident_id, "evaluate_report", tc.arguments, {
-                    "passed_deterministic": validation.passed_deterministic,
-                    "deterministic_notes": validation.deterministic_notes,
-                    "verdict": validation.verdict,
-                    "evaluator_notes": validation.evaluator_notes,
-                })
-                if not validation.passed_deterministic or validation.verdict == "evaluator_error":
-                    # Give the model a chance to fix it within its remaining iterations.
-                    messages.append(llm.tool_result_message(tc, {
-                        "status": "rejected",
-                        "reason": validation.deterministic_notes if not validation.passed_deterministic else validation.evaluator_notes,
-                        "instruction": "Correct the report (use only tools you actually called) and call submit_incident_report again.",
-                    }))
+                obs_text = _obs_text(observations)
+                queued = _queued_reindex_scope(incident_id)
+                clean, problems = check_report(tc.arguments, ok_tools, obs_text, queued)
+                if problems and rejections < MAX_REJECTIONS and not last_turn:
+                    # Reflection: send the draft back so the agent can repair it.
+                    rejections += 1
+                    _log_step(incident_id, "reflection_check", {"attempt": rejections},
+                              {"verdict": "rejected", "problems": problems})
                     if on_step:
-                        on_step("evaluate_report", {"rejected": True, "notes": validation.deterministic_notes})
+                        on_step("reflection_check", {"verdict": "rejected", "problems": problems})
+                    messages.append(llm.tool_result_message(tc, {
+                        "status": "rejected", "problems": problems,
+                        "instruction": ("Fix these problems using only evidence from tools you actually "
+                                        "called successfully, then call submit_incident_report again."),
+                    }))
                     continue
-                final_report = validation.final_report
+                if clean is None:
+                    # Malformed report and no retries left: record it, never persist garbage.
+                    execute(
+                        "UPDATE incidents SET status = 'incomplete', root_cause = %s WHERE incident_id = %s",
+                        ("Agent produced an invalid report: " + "; ".join(problems), incident_id),
+                    )
+                    messages.append(llm.tool_result_message(tc, {"status": "invalid"}))
+                    _cancel_pending(incident_id)
+                    invalid_report = True
+                    continue
+
+                verdict, notes, revised = evaluate_report(clean, observations)
+                llm_calls += 1
+                if verdict == "corrected":
+                    # A correction is only accepted if it passes the SAME schema + evidence + scope checks.
+                    fixed, fixed_problems = check_report(revised, ok_tools, obs_text, queued)
+                    if fixed is not None and not fixed_problems:
+                        clean = fixed
+                    else:
+                        verdict = "invalid"
+                        notes += " [evaluator correction failed validation: " + "; ".join(fixed_problems) + "]"
+                if problems or verdict == "invalid":
+                    passed: bool | None = False
+                elif verdict == "unavailable":
+                    passed = None      # evaluator could not run: report is NOT validated
+                else:
+                    passed = True
+                if problems:
+                    notes = "Open problems after retries: " + "; ".join(problems) + " | " + notes
+                _save_report(incident_id, clean)
                 execute(
                     "UPDATE incidents SET validation_passed = %s, validation_notes = %s WHERE incident_id = %s",
-                    (True, validation.evaluator_notes, incident_id),
+                    (passed, notes, incident_id),
                 )
-                _save_report(incident_id, final_report)
+                if passed is False:
+                    final_status = "incomplete"
+                    execute("UPDATE incidents SET status = 'incomplete' WHERE incident_id = %s", (incident_id,))
+                    _cancel_pending(incident_id)
+                _log_step(incident_id, "reflection_check", {"attempt": rejections + 1},
+                          {"verdict": verdict, "passed": passed, "notes": notes})
+                _log_step(incident_id, tc.name, clean, {"saved": True, "incident_id": incident_id})
                 if on_step:
-                    on_step(tc.name, final_report)
+                    on_step(tc.name, clean)
                 messages.append(llm.tool_result_message(
                     tc, {"status": "saved", "incident_id": incident_id}))
-                submitted = final_report
+                submitted = clean
                 continue
 
             if tc.name in REMEDIATION_TOOLS:
                 # Override any LLM-supplied incident_id with the real one for this investigation.
                 tc.arguments["incident_id"] = incident_id
-            if tc.name not in tool_names:
-                result: Any = {"error": f"unknown tool '{tc.name}'"}
+            if "_raw" in tc.arguments:
+                result: Any = {"error": "arguments were not valid JSON; call the tool again with valid JSON arguments"}
+            elif tc.name not in tool_names:
+                result = {"error": f"unknown tool '{tc.name}'"}
             else:
-                try:
-                    result = await mcp.call_tool(tc.name, tc.arguments)
-                except Exception as e:  # a tool raising must not crash the whole investigation
-                    result = {"error": f"tool '{tc.name}' failed: {e}"}
+                arg_error = _validate_args(tc.name, tc.arguments, schemas)
+                if arg_error:
+                    result = {"error": arg_error}
+                else:
+                    try:
+                        result = await mcp.call_tool(tc.name, tc.arguments)
+                    except Exception as e:  # a tool raising must not crash the whole investigation
+                        result = {"error": f"tool '{tc.name}' failed: {e}"}
             tools_used.append(tc.name)
             _log_step(incident_id, tc.name, tc.arguments, result)
+            observations.append({"tool": tc.name, "input": tc.arguments, "output": result})
+            if not (isinstance(result, dict) and "error" in result):
+                ok_tools.add(tc.name)
             if on_step:
                 on_step(tc.name, {"input": tc.arguments, "output": result})
             payload = dumps(result)
@@ -244,15 +350,23 @@ async def run_investigation(
                 payload = payload[:TOOL_RESULT_CHAR_CAP] + "...<truncated>"
             messages.append(llm.tool_result_message(tc, payload))
 
+        if invalid_report and submitted is None:
+            return InvestigationResult(
+                incident_id=incident_id, status="incomplete", report=None,
+                run_id=run_id, alert_id=alert_id, llm_calls=llm_calls,
+                tools_used=tools_used, usage_totals=usage_totals,
+            )
+
         if submitted is not None:
             return InvestigationResult(
-                incident_id=incident_id, status="report_submitted", report=submitted,
+                incident_id=incident_id, status=final_status, report=submitted,
                 run_id=run_id, alert_id=alert_id, llm_calls=llm_calls,
                 tools_used=tools_used, usage_totals=usage_totals,
             )
 
     # Fell through without a submitted report (shouldn't happen due to forced last turn).
     execute("UPDATE incidents SET status = 'incomplete' WHERE incident_id = %s", (incident_id,))
+    _cancel_pending(incident_id)
     return InvestigationResult(
         incident_id=incident_id, status="incomplete", report=None,
         run_id=run_id, alert_id=alert_id, llm_calls=llm_calls,
