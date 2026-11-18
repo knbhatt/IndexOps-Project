@@ -24,7 +24,8 @@ from typing import Any, Callable
 from indexops import llm_client as llm
 from indexops.db import execute, fetch_one, dumps
 from indexops.agent.prompt import SYSTEM_PROMPT, SUBMIT_TOOL, SUBMIT_TOOL_NAME
-from indexops.agent.validate import check_report, evaluate_report
+from indexops.agent.validate import check_report, evaluate_report, structured_counts
+from indexops.revision import STARTUP as _REVISION
 
 MAX_ITERATIONS = 15
 TOOL_RESULT_CHAR_CAP = 8000
@@ -202,6 +203,12 @@ async def run_investigation(
         )
 
     incident_id = _create_incident(alert_id, run_id)
+    try:
+        model_name = llm.describe().get("model")
+    except Exception:
+        model_name = None
+    # Record which code and model produced this investigation (captured at process start).
+    _log_step(incident_id, "run_context", {}, {**_REVISION, "model": model_name})
 
     # Static prefix first (system prompt + tool defs) -> cacheable. Dynamic content last.
     tools = llm.mcp_tools_to_llm_tools(mcp.tools) + [SUBMIT_TOOL]
@@ -260,7 +267,23 @@ async def run_investigation(
             if tc.name == SUBMIT_TOOL_NAME:
                 obs_text = _obs_text(observations)
                 queued = _queued_reindex_scope(incident_id)
-                clean, problems = check_report(tc.arguments, ok_tools, obs_text, queued)
+                counts = structured_counts(observations)
+
+                # The index is rebuilt every run: if a newer run started while we were investigating,
+                # this diagnosis may describe a different index than the one now live.
+                latest_now = _latest_run_id()
+                if run_id is not None and latest_now is not None and latest_now != run_id:
+                    execute(
+                        "UPDATE incidents SET status = 'incomplete', root_cause = %s WHERE incident_id = %s",
+                        (f"Run {run_id} was superseded by run {latest_now} during the investigation; "
+                         "re-investigate the latest run.", incident_id),
+                    )
+                    _cancel_pending(incident_id)
+                    messages.append(llm.tool_result_message(tc, {"status": "invalid"}))
+                    invalid_report = True
+                    continue
+
+                clean, problems = check_report(tc.arguments, ok_tools, obs_text, queued, counts)
                 if problems and rejections < MAX_REJECTIONS and not last_turn:
                     # Reflection: send the draft back so the agent can repair it.
                     rejections += 1
@@ -285,11 +308,14 @@ async def run_investigation(
                     invalid_report = True
                     continue
 
-                verdict, notes, revised = evaluate_report(clean, observations)
+                try:
+                    verdict, notes, revised = evaluate_report(clean, observations)
+                except Exception as e:  # last line of defence: never lose the incident outcome
+                    verdict, notes, revised = "unavailable", f"evaluator crashed: {type(e).__name__}: {e}", None
                 llm_calls += 1
                 if verdict == "corrected":
                     # A correction is only accepted if it passes the SAME schema + evidence + scope checks.
-                    fixed, fixed_problems = check_report(revised, ok_tools, obs_text, queued)
+                    fixed, fixed_problems = check_report(revised, ok_tools, obs_text, queued, counts)
                     if fixed is not None and not fixed_problems:
                         clean = fixed
                     else:

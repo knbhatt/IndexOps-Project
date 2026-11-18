@@ -104,3 +104,47 @@ def test_evaluator_llm_failure_is_unavailable_and_not_retried():
     with patch.object(V.llm, "chat", side_effect=RuntimeError("429")) as chat:
         assert V.evaluate_report(_report(), [])[0] == "unavailable"
     assert chat.call_count == 1
+
+
+# ---------------- re-review regressions ----------------
+import json
+
+
+def _big_obs(n=14, size=50000):
+    return [{"tool": f"t{i}", "input": {"run_id": 1}, "output": {"blob": "x" * size}} for i in range(n)]
+
+
+def test_digest_is_always_valid_json_and_bounded():
+    d = V.build_observation_digest(_big_obs())
+    s = json.dumps(d)
+    json.loads(s)
+    assert len(s) <= 40000 and d["observations"]
+
+
+def test_evaluator_handles_oversized_observation_history():
+    with patch.object(V.llm, "chat", return_value=_resp(verdict="approve", notes="ok")):
+        assert V.evaluate_report(_report(), _big_obs())[0] == "approve"
+
+
+def test_input_preparation_failure_is_unavailable_not_an_exception():
+    with patch.object(V, "build_observation_digest", side_effect=ValueError("bad")):
+        verdict, notes, _ = V.evaluate_report(_report(), [])
+    assert verdict == "unavailable" and "preparation failed" in notes
+
+
+def test_structured_counts_reads_count_fields_and_id_list_lengths():
+    obs = [{"tool": "c", "output": {"mismatched_count": 500, "source_count": 2500,
+                                     "mismatched_ticket_ids": [500, 501, 502], "samples": [{"ticket_count": 7}]}}]
+    c = V.structured_counts(obs)
+    assert {500, 3, 7} <= c and 2500 not in c and 501 not in c
+
+
+def test_count_matching_unrelated_ticket_id_is_flagged_with_structured_counts():
+    counts = {500}                                   # real metric; a ticket id 50 would not be here
+    _, problems = V.check_report(_report(affected_ticket_count=50), {"get_run_metrics"}, '[..."50"...]', count_values=counts)
+    assert any("does not match any count field" in p for p in problems)
+
+
+def test_count_equal_to_structured_metric_passes():
+    _, problems = V.check_report(_report(affected_ticket_count=500), {"get_run_metrics"}, OBS, count_values={500})
+    assert problems == []

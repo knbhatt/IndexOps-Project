@@ -25,7 +25,7 @@ class FakeMCP:
         self.calls.append(name)
         if name in self.fail:
             raise RuntimeError("boom")
-        return {"mismatch_count": 600, "queued": 40}
+        return {"mismatch_count": 600, "ticket_count": 40}
 
 
 def reply(*calls, text=None):
@@ -208,3 +208,56 @@ def test_iteration_cap_without_submit_is_incomplete(env):
     env.chat.return_value = reply(text="still thinking")
     assert run(FakeMCP()).status == "incomplete"
     assert env.chat.call_count == L.MAX_ITERATIONS
+
+
+# ---------------- re-review regressions ----------------
+class BigMCP(FakeMCP):
+    """Every observation is huge, like a long investigation with large tool outputs."""
+    async def call_tool(self, name, args):
+        self.calls.append(name)
+        return {"mismatch_count": 600, "blob": "x" * 50000}
+
+
+def test_oversized_observation_history_does_not_crash_the_real_evaluator():
+    import json
+    with _env(real_evaluator=True) as env:
+        verdict = LLMResponse(text=None, tool_calls=[
+            LLMToolCall(id="e", name="evaluate_report", arguments={"verdict": "approve", "notes": "ok"})])
+        many_calls = reply(*[call("get_run_metrics", run_id=1) for _ in range(14)])
+        env.chat.side_effect = [many_calls, submit(), verdict]
+        res = run(BigMCP())
+        evaluator_prompt = env.chat.call_args_list[2][0][0][1]["content"]
+    assert res.status == "report_submitted" and env.chat.call_count == 3
+    parsed = json.loads(evaluator_prompt)                  # must be valid JSON
+    assert len(evaluator_prompt) < 45000 and parsed["observations"]
+
+
+def test_evaluator_crash_at_loop_boundary_leaves_a_clear_unvalidated_outcome(env):
+    env.chat.side_effect = [reply(call("get_run_metrics", run_id=1)), submit()]
+    with patch.object(L, "evaluate_report", side_effect=RuntimeError("boom")):
+        res = run(FakeMCP())
+    assert res.status == "report_submitted"
+    updates = [c for c in env.execute.call_args_list if "validation_passed" in c[0][0]]
+    assert updates[-1][0][1][0] is None and "crashed" in updates[-1][0][1][1]
+
+
+def test_count_matching_an_unrelated_ticket_id_is_rejected_then_repaired():
+    class IdMCP(FakeMCP):
+        async def call_tool(self, name, args):
+            self.calls.append(name)
+            return {"mismatch_count": 500, "mismatched_ticket_ids": [500, 501]}
+    with _env() as env:
+        env.chat.side_effect = [reply(call("get_run_metrics", run_id=1)), submit(count=50), submit(count=500)]
+        assert run(IdMCP()).status == "report_submitted"
+        assert env.chat.call_count == 3
+        assert env.save.call_args[0][1]["affected_ticket_count"] == 500
+
+
+def test_run_superseded_during_investigation_is_incomplete_and_cancels_actions():
+    with _env() as env:
+        env.chat.side_effect = [reply(call("get_run_metrics", run_id=1)), submit()]
+        with patch.object(L, "_latest_run_id", side_effect=[1, 2]):      # entry: run 1, at submit: run 2
+            res = run(FakeMCP())
+    assert res.status == "incomplete"
+    env.save.assert_not_called()
+    env.cancel.assert_called()

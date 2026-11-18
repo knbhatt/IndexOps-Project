@@ -58,12 +58,43 @@ def _fmt_errors(e: ValidationError) -> str:
     return "schema: " + "; ".join(parts)
 
 
+_NON_IMPACT_COUNTS = {"source_count", "indexed_count"}   # totals, not "affected tickets"
+
+
+def structured_counts(observations: list[dict[str, Any]]) -> set[int]:
+    """Integer values of explicit *count fields* in tool outputs (e.g. mismatched_count,
+    ticket_count) plus the length of every *_ids list. Used to ground affected_ticket_count
+    in typed metrics instead of matching a substring that could be an unrelated ticket id."""
+    vals: set[int] = set()
+
+    def walk(x: Any, key: str = "") -> None:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                walk(v, str(k))
+        elif isinstance(x, list):
+            if key.endswith("_ids"):
+                vals.add(len(x))
+            for v in x:
+                if isinstance(v, (dict, list)):
+                    walk(v, key)
+        elif isinstance(x, (int, float)) and not isinstance(x, bool):
+            if key.endswith("count") and key not in _NON_IMPACT_COUNTS:
+                vals.add(int(x))
+
+    for o in observations:
+        walk(o.get("output"))
+    return vals
+
+
 def check_report(
-    report: Any, called_tools: set[str], observations_text: str, queued_scope: int | None = None
+    report: Any, called_tools: set[str], observations_text: str, queued_scope: int | None = None,
+    count_values: set[int] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Return (clean_report_or_None, problems). None means the schema itself is invalid.
 
     queued_scope = ticket_count of the pending reindex action queued for this incident (or None).
+    count_values = structured count fields found in tool outputs (see structured_counts). When
+    present, affected_ticket_count must equal one of them; otherwise we fall back to a text match.
     """
     try:
         model = IncidentReport.model_validate(report)
@@ -78,8 +109,14 @@ def check_report(
                 f"(successfully called: {sorted(called_tools)})"
             )
     n = model.affected_ticket_count
-    if n > 0 and str(n) not in observations_text:
-        problems.append(f"affected_ticket_count={n} does not appear in any tool result")
+    if n > 0:
+        if count_values:
+            if n not in count_values:
+                problems.append(
+                    f"affected_ticket_count={n} does not match any count field in the tool results "
+                    f"(count fields found: {sorted(count_values)[:12]})")
+        elif str(n) not in observations_text:
+            problems.append(f"affected_ticket_count={n} does not appear in any tool result")
     clean = model.model_dump()
     if clean.get("proposed_remediation_tool") == "reindex_affected_tickets":
         if queued_scope is None:
@@ -137,12 +174,29 @@ class EvaluatorVerdict(BaseModel):
         return self
 
 
-def _compact(observations: list[dict[str, Any]], per_output: int = 3000, total: int = 40000) -> str:
-    items = []
-    for o in observations:
-        out = json.dumps(o.get("output"), default=str)
-        items.append({"tool": o.get("tool"), "input": o.get("input"), "output": out[:per_output]})
-    return json.dumps(items, default=str)[:total]
+def _cut(value: Any, limit: int) -> str:
+    s = json.dumps(value, default=str)
+    return s if len(s) <= limit else s[:limit] + "...[truncated]"
+
+
+def build_observation_digest(observations: list[dict[str, Any]], total: int = 40000) -> dict[str, Any]:
+    """Compact the observation history for the evaluator. ALWAYS returns structures that serialize
+    to valid JSON within `total` characters: long values are shortened as *strings* (never by
+    slicing serialized JSON), then the oldest observations are dropped whole if still too large."""
+    def render(limit: int) -> list[dict[str, Any]]:
+        return [{"tool": o.get("tool"), "input": _cut(o.get("input"), 500), "output": _cut(o.get("output"), limit)}
+                for o in observations]
+
+    limit = 3000
+    items = render(limit)
+    while len(json.dumps(items)) > total and limit > 200:
+        limit //= 2
+        items = render(limit)
+    omitted = 0
+    while len(json.dumps(items)) > total and len(items) > 1:
+        items.pop(0)
+        omitted += 1
+    return {"observations": items, "omitted_older_observations": omitted}
 
 
 def evaluate_report(
@@ -156,13 +210,14 @@ def evaluate_report(
       'invalid'     - evaluator answered, but not in the required shape (retried once)
       'unavailable' - the evaluator call itself failed (quota/network); report stays unvalidated
     """
-    messages = [
-        {"role": "system", "content": EVALUATOR_SYSTEM},
-        {"role": "user", "content": json.dumps({
-            "draft_report": report,
-            "observations": json.loads(_compact(observations)) if observations else [],
-        }, default=str)},
-    ]
+    try:
+        digest = build_observation_digest(observations)
+        messages = [
+            {"role": "system", "content": EVALUATOR_SYSTEM},
+            {"role": "user", "content": json.dumps({"draft_report": report, **digest}, default=str)},
+        ]
+    except Exception as e:  # input preparation must never crash the investigation
+        return "unavailable", f"evaluator input preparation failed: {type(e).__name__}: {e}", None
     last_problem = "no attempt made"
     for _attempt in range(2):  # one retry for a malformed answer
         try:
