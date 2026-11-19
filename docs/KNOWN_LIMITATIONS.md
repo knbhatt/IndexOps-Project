@@ -18,6 +18,11 @@ The dashboard and FastAPI `/approve` route are unauthenticated. Streamlit is bou
 (`.streamlit/config.toml` and the launch commands) and the infrastructure ports are loopback-only.
 Add authentication and authorization before any shared deployment.
 
+### Manual override (what it can and cannot do)
+The dashboard's override waives ONLY the "incident is validated" requirement. The stale-run check and
+the report/action scope check always apply, and every override is recorded in
+`remediation_actions.params.approval_override` (timestamp and the incident's validation state).
+
 ## 3. Evidence grounding limits
 `affected_ticket_count` must equal a typed count field returned by a tool (for example `mismatched_count`
 or the queued `ticket_count`). Free-text claims are checked by the evaluator model, which is a semantic

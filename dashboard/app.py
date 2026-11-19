@@ -7,7 +7,7 @@ Modes of investigation:
   1. Alert-triggered (from an alerts row)
   2. Free-form question (Interactive Investigation)
 
-Run:  python -m streamlit run dashboard/app.py
+Run:  streamlit run dashboard/app.py --server.address 127.0.0.1
 """
 from __future__ import annotations
 

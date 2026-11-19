@@ -7,6 +7,7 @@ this module is the only place that executes them.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import time
 from typing import Any
 
@@ -20,8 +21,12 @@ from indexops.contract import TICKETS_INDEX, EMBEDDING_MODEL, EMBEDDING_DIM, exp
 from indexops.db import fetch_one, execute, fetch_all, os_client, dumps
 
 
-def _gate(row: dict[str, Any], allow_unvalidated: bool) -> str | None:
-    """Return a reason the action must NOT run, or None if it may run."""
+def _gate(row: dict[str, Any], allow_unvalidated: bool) -> tuple[str | None, dict[str, Any] | None]:
+    """Return (reason_to_block_or_None, incident_row).
+
+    Order matters: the stale-run and report/action scope checks ALWAYS apply. The manual override
+    can waive only the "incident is validated" requirement, never these two.
+    """
     inc = None
     if row.get("incident_id") is not None:
         inc = fetch_one(
@@ -29,20 +34,15 @@ def _gate(row: dict[str, Any], allow_unvalidated: bool) -> str | None:
             (row["incident_id"],),
         )
     if inc is None:
-        return "action has no incident; refusing to run an unreviewed action"
+        return "action has no incident; refusing to run an unreviewed action", None
 
     # Stale incidents are never executable: the index is rebuilt every run, so an older
     # incident's evidence no longer describes the live state. Re-investigate instead.
     latest = (fetch_one("SELECT MAX(run_id) AS m FROM pipeline_runs") or {}).get("m")
     if inc.get("run_id") is not None and latest is not None and inc["run_id"] != latest:
         return (f"incident is for run {inc['run_id']} but the latest run is {latest}; "
-                "re-investigate the latest run before approving")
+                "re-investigate the latest run before approving"), inc
 
-    if allow_unvalidated:
-        return None
-    if inc.get("validation_passed") is not True:
-        return ("incident report is not validated (validation_passed is not true); "
-                "fix the report or use the explicit unvalidated override")
     params = row.get("params") or {}
     if isinstance(params, str):
         params = json.loads(params)
@@ -50,10 +50,16 @@ def _gate(row: dict[str, Any], allow_unvalidated: bool) -> str | None:
     if isinstance(report, str):
         report = json.loads(report)
     if row.get("action_taken") == "reindex_affected_tickets":
+        if not report:
+            return "incident has no saved report to compare the queued action against", inc
         if report.get("affected_ticket_count") != params.get("ticket_count"):
             return (f"scope mismatch: report says {report.get('affected_ticket_count')} tickets but the "
-                    f"queued action covers {params.get('ticket_count')}")
-    return None
+                    f"queued action covers {params.get('ticket_count')}"), inc
+
+    if not allow_unvalidated and inc.get("validation_passed") is not True:
+        return ("incident report is not validated (validation_passed is not true); "
+                "fix the report or use the explicit unvalidated override"), inc
+    return None, inc
 
 
 def approve(action_id: int, allow_unvalidated: bool = False) -> dict[str, Any]:
@@ -69,9 +75,15 @@ def approve(action_id: int, allow_unvalidated: bool = False) -> dict[str, Any]:
     if row["status"] != "pending":
         return {"error": f"action_id {action_id} is '{row['status']}', not 'pending'"}
 
-    blocked = _gate(row, allow_unvalidated)
+    blocked, inc = _gate(row, allow_unvalidated)
     if blocked:
         return {"action_id": action_id, "status": "blocked", "error": blocked}
+
+    # Durable audit trail: record when the validation requirement was manually waived.
+    override_used = bool(allow_unvalidated and not (inc and inc.get("validation_passed") is True))
+    audit = ({"approval_override": {
+        "used": True, "incident_validation_passed": (inc or {}).get("validation_passed"),
+        "approved_at": datetime.now(timezone.utc).isoformat()}} if override_used else {})
 
     # Atomic claim: only one concurrent approver can move pending -> running.
     claimed = execute(
@@ -103,16 +115,17 @@ def approve(action_id: int, allow_unvalidated: bool = False) -> dict[str, Any]:
                SET status = %s, records_fixed = %s, records_failed = %s,
                    params = COALESCE(params, '{}'::jsonb) || %s::jsonb
                WHERE action_id = %s""",
-            (status, fixed, failed, dumps({"execution_result": result}), action_id),
+            (status, fixed, failed, dumps({"execution_result": result, **audit}), action_id),
         )
-        return {"action_id": action_id, "status": status, "action": action, **result}
+        return {"action_id": action_id, "status": status, "action": action,
+                "override_used": override_used, **result}
     except Exception as e:
         execute(
             """UPDATE remediation_actions
                SET status = 'failed',
                    params = COALESCE(params, '{}'::jsonb) || %s::jsonb
                WHERE action_id = %s""",
-            (dumps({"execution_error": str(e)}), action_id),
+            (dumps({"execution_error": str(e), **audit}), action_id),
         )
         return {"action_id": action_id, "status": "failed", "action": action, "error": str(e)}
 

@@ -207,7 +207,7 @@ This will:
 ### 6. Open the dashboard
 
 ```powershell
-python -m streamlit run dashboard/app.py
+python -m streamlit run dashboard/app.py --server.address 127.0.0.1
 ```
 
 Open **http://localhost:8501**
@@ -244,7 +244,7 @@ docker exec indexops-postgres psql -U airflow -d airflow -c "SELECT COUNT(*) FRO
 ## Optional: FastAPI + CLI investigation
 
 ```powershell
-python -m uvicorn api.main:app --port 8000
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
 CLI agent (uses the alert id from `demo.ps1`):
@@ -324,7 +324,7 @@ After a PC reboot:
 # Start Docker Desktop first, then:
 docker compose up -d
 .\demo.ps1 -SkipInvestigate
-python -m streamlit run dashboard/app.py
+python -m streamlit run dashboard/app.py --server.address 127.0.0.1
 ```
 
 Full wipe (delete volumes and reseed):

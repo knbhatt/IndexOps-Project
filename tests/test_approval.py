@@ -92,3 +92,29 @@ def test_reindex_tool_stages_full_scope_ignoring_agent_sample():
 def test_reindex_tool_with_nothing_to_fix_errors():
     with patch.object(R, "_affected_ids", return_value=[]):
         assert "error" in R.reindex_affected_tickets(reason="x")
+
+
+# ---------------- re-review: the manual override must not bypass scope or stale checks ----------------
+def test_override_cannot_bypass_scope_mismatch():
+    out, ex = _approve(_action(count=40), _inc(passed=None, count=414), allow_unvalidated=True)
+    assert out["status"] == "blocked" and "scope mismatch" in out["error"]
+    assert not any("'running'" in c[0][0] for c in ex.call_args_list)       # never claimed
+
+
+def test_override_cannot_run_a_reindex_with_no_saved_report():
+    inc = {"status": "incomplete", "validation_passed": False, "run_id": 1, "report": None}
+    out, _ = _approve(_action(), inc, allow_unvalidated=True)
+    assert out["status"] == "blocked" and "no saved report" in out["error"]
+
+
+def test_override_use_is_written_to_the_audit_record():
+    out, ex = _approve(_action(), _inc(passed=None), allow_unvalidated=True)
+    assert out["status"] == "completed" and out["override_used"] is True
+    finals = [c for c in ex.call_args_list if "execution_result" in str(c)]
+    assert finals and "approval_override" in finals[-1][0][1][3]
+
+
+def test_normal_validated_approval_records_no_override():
+    out, ex = _approve(_action(), _inc(passed=True))
+    assert out["override_used"] is False
+    assert not any("approval_override" in str(c) for c in ex.call_args_list)
